@@ -10,7 +10,7 @@ from typing import Any
 import requests
 INFO_URL = "https://api.hyperliquid.xyz/info" #hy
 # Tune these values to your account and actual fee tier.
-POLL_SECONDS = 19
+POLL_SECONDS = 10
 MIN_NET_APY = 0.05         # 10% annualized after estimated costs
 SPOT_TAKER_FEE = 0.00035    # 0.035%, example only
 PERP_TAKER_FEE = 0.00035    # 0.035%, example only
