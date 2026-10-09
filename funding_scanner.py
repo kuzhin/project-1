@@ -4,23 +4,18 @@ The scanner only reads public market data. It does not place orders.
 """
 
 from __future__ import annotations
-
 import time
 from datetime import datetime, timezone
 from typing import Any
-
 import requests
-
-INFO_URL = "https://api.hyperliquid.xyz/info"
-
+INFO_URL = "https://api.hyperliquid.xyz/info" #hy
 # Tune these values to your account and actual fee tier.
-POLL_SECONDS = 1
+POLL_SECONDS = 19
 MIN_NET_APY = 0.05         # 10% annualized after estimated costs
 SPOT_TAKER_FEE = 0.00035    # 0.035%, example only
 PERP_TAKER_FEE = 0.00035    # 0.035%, example only
 SLIPPAGE_PER_LEG = 0.0050  # 0.05%, estimate per entry/exit leg
 HOURS_PER_YEAR = 24 * 365   # Hyperliquid funding is hourly
-
 
 session = requests.Session()
 
@@ -97,7 +92,7 @@ def scan() -> list[dict[str, Any]]:
         if net_apy < MIN_NET_APY:
             continue
 
-        opportunities.append( 
+        opportunities.append(
             {
                 "pair": pair,
                 "perp": perp_market["name"],
