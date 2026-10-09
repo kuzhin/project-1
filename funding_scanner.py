@@ -97,7 +97,7 @@ def scan() -> list[dict[str, Any]]:
         if net_apy < MIN_NET_APY:
             continue
 
-        opportunities.append(
+        opportunities.append( 
             {
                 "pair": pair,
                 "perp": perp_market["name"],
