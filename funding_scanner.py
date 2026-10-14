@@ -1,139 +1,208 @@
-﻿"""Realtime funding-arbitrage scanner for Hyperliquid.
+"""24/7 read-only funding-arbitrage monitor for Hyperliquid.
 
-The scanner only reads public market data. It does not place orders.
+Combines public REST market data with public WebSocket funding updates,
+reconnects automatically, and optionally sends Telegram alerts. It never
+places orders.
 """
-
 from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any
+
 import requests
-INFO_URL = "https://api.hyperliquid.xyz/info" #hy
-# Tune these values to your account and actual fee tier.
-POLL_SECONDS = 11
-MIN_NET_APY = 0.05         # 10% annualized after estimated costs
-SPOT_TAKER_FEE = 0.00035    # 0.035%, example only
-PERP_TAKER_FEE = 0.00035    # 0.035%, example only
-SLIPPAGE_PER_LEG = 0.0050  # 0.05%, estimate per entry/exit leg
-HOURS_PER_YEAR = 24 * 365   # Hyperliquid funding is hourly
+import websockets
 
-session = requests.Session()
+INFO_URL = "https://api.hyperliquid.xyz/info"
+WS_URL = "wss://api.hyperliquid.xyz/ws"
+POLL_SECONDS = float(os.getenv("MARKET_REFRESH_SECONDS", "15"))
+MIN_NET_APR = float(os.getenv("MIN_NET_APR", "0.10"))
+EXPECTED_HOLDING_HOURS = float(os.getenv("EXPECTED_HOLDING_HOURS", "24"))
+MIN_NOTIONAL_USDC = float(os.getenv("MIN_NOTIONAL_USDC", "0"))
+ALLOW_SHORT_SPOT = os.getenv("ALLOW_SHORT_SPOT", "0") == "1"
+SPOT_FEE = float(os.getenv("SPOT_TAKER_FEE", "0.00035"))
+PERP_FEE = float(os.getenv("PERP_TAKER_FEE", "0.00035"))
+SLIPPAGE_PER_LEG = float(os.getenv("SLIPPAGE_PER_LEG", "0.0005"))
+HOURS_PER_YEAR = 24.0 * 365.0
+ALERT_COOLDOWN = float(os.getenv("ALERT_COOLDOWN_SECONDS", "1800"))
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("hyperliquid-funding")
 
 
-def info(payload: dict[str, Any]) -> Any:
-    response = session.post(INFO_URL, json=payload, timeout=10)
-    response.raise_for_status()
-    return response.json()
+@dataclass
+class Market:
+    pair: str
+    coin: str
+    funding_hour: float
+    perp_price: float
+    spot_price: float
+    open_interest: float = 0.0
 
 
-def as_float(value: Any) -> float | None:
+def number(value: Any) -> float | None:
     try:
         return None if value in (None, "") else float(value)
     except (TypeError, ValueError):
         return None
 
 
-def scan() -> list[dict[str, Any]]:
-    perp_meta, perp_contexts = info({"type": "metaAndAssetCtxs"})
-    spot_meta, spot_contexts = info({"type": "spotMetaAndAssetCtxs"})
+def post_info(payload: dict[str, Any]) -> Any:
+    response = requests.post(INFO_URL, json=payload, timeout=15)
+    response.raise_for_status()
+    return response.json()
 
-    perp_by_coin: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
-    for market, context in zip(perp_meta["universe"], perp_contexts):
-        coin = market.get("name", "")
-        if coin and not market.get("isDelisted", False):
-            perp_by_coin[coin.upper()] = (market, context)
 
-    # Entry + exit for both legs: spot and perp.
-    round_trip_cost = 2 * (
-        SPOT_TAKER_FEE + PERP_TAKER_FEE + 2 * SLIPPAGE_PER_LEG
-    )
-    opportunities: list[dict[str, Any]] = []
-
-    for spot_market, spot_context in zip(
-        spot_meta["universe"], spot_contexts
-    ):
-        if spot_market.get("isDelisted", False):
-            continue
-
-        pair = spot_market.get("name", "")
-        if "/" not in pair:
+def load_markets() -> dict[str, Market]:
+    perp_meta, perp_ctx = post_info({"type": "metaAndAssetCtxs"})
+    spot_meta, spot_ctx = post_info({"type": "spotMetaAndAssetCtxs"})
+    perps: dict[str, tuple[str, dict[str, Any]]] = {}
+    for meta, ctx in zip(perp_meta.get("universe", []), perp_ctx):
+        coin = str(meta.get("name", ""))
+        if coin and not meta.get("isDelisted", False):
+            perps[coin.upper()] = (coin, ctx)
+    result: dict[str, Market] = {}
+    for meta, ctx in zip(spot_meta.get("universe", []), spot_ctx):
+        pair = str(meta.get("name", ""))
+        if meta.get("isDelisted", False) or "/" not in pair:
             continue
         base, quote = pair.split("/", 1)
-        if quote.upper() != "USDC":
+        if quote.upper() not in {"USDC", "USD"} or base.upper() not in perps:
             continue
-
-        perp_item = perp_by_coin.get(base.upper())
-        if perp_item is None:
+        coin, pctx = perps[base.upper()]
+        funding = number(pctx.get("funding"))
+        perp = number(pctx.get("markPx")) or number(pctx.get("oraclePx"))
+        spot = number(ctx.get("midPx")) or number(ctx.get("markPx"))
+        oi = number(pctx.get("openInterest")) or 0.0
+        if funding is None or perp is None or spot is None or min(perp, spot) <= 0:
             continue
-        perp_market, perp_context = perp_item
-
-        # Positive funding pays the short perpetual leg:
-        # buy spot + short perp. Negative funding would require shorting spot.
-        funding_hour = as_float(perp_context.get("funding"))
-        mark_price = as_float(perp_context.get("markPx"))
-        oracle_price = as_float(perp_context.get("oraclePx"))
-        spot_price = (
-            as_float(spot_context.get("midPx"))
-            or as_float(spot_context.get("markPx"))
-        )
-        if funding_hour is None or mark_price is None or oracle_price is None:
-            continue
-        if spot_price is None or min(mark_price, oracle_price, spot_price) <= 0:
-            continue
-
-        # Only this direction is generally implementable without spot borrowing.
-        if funding_hour <= 0:
-            continue
-
-        gross_apy = funding_hour * HOURS_PER_YEAR
-        net_apy = gross_apy - round_trip_cost
-        basis = mark_price / spot_price - 1.0
-
-        if net_apy < MIN_NET_APY:
-            continue
-
-        opportunities.append(
-            {
-                "pair": pair,
-                "perp": perp_market["name"],
-                "funding_hour": funding_hour,
-                "gross_apy": gross_apy,
-                "net_apy": net_apy,
-                "spot_price": spot_price,
-                "perp_price": mark_price,
-                "basis": basis,
-            }
-        )
-
-    return sorted(opportunities, key=lambda row: row["net_apy"], reverse=True)
+        result[coin] = Market(pair, coin, funding, perp, spot, oi)
+    return result
 
 
-def print_results(rows: list[dict[str, Any]]) -> None:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"\n{timestamp} | opportunities: {len(rows)}")
-    print("PAIR         FUNDING/h    NET APY     BASIS       ACTION")
-    print("-" * 78)
-    for row in rows:
-        print(
-            f"{row['pair']:<12} "
-            f"{row['funding_hour']:+.5%}   "
-            f"{row['net_apy']:+8.2%}   "
-            f"{row['basis']:+.3%}   "
-            "LONG spot + SHORT perp"
-        )
+def net_apr(funding_hour: float) -> tuple[float, float]:
+    gross = abs(funding_hour) * HOURS_PER_YEAR
+    round_trip = 2.0 * (SPOT_FEE + PERP_FEE + 2.0 * SLIPPAGE_PER_LEG)
+    annual_cost = round_trip / max(EXPECTED_HOLDING_HOURS, 1e-9) * HOURS_PER_YEAR
+    return gross, gross - annual_cost
+
+
+def opportunity(market: Market) -> dict[str, Any] | None:
+    if market.open_interest * market.perp_price < MIN_NOTIONAL_USDC:
+        return None
+    if market.funding_hour > 0:
+        direction = "LONG spot + SHORT perp"
+    elif market.funding_hour < 0 and ALLOW_SHORT_SPOT:
+        direction = "SHORT spot + LONG perp (borrow required)"
+    else:
+        return None
+    gross, net = net_apr(market.funding_hour)
+    if net < MIN_NET_APR:
+        return None
+    return {"pair": market.pair, "coin": market.coin, "funding_hour": market.funding_hour,
+            "gross_apr": gross, "net_apr": net,
+            "basis": market.perp_price / market.spot_price - 1,
+            "spot_price": market.spot_price, "perp_price": market.perp_price,
+            "direction": direction}
+
+
+def format_signal(row: dict[str, Any]) -> str:
+    return (f"SIGNAL {row['pair']} | {row['direction']} | "
+            f"funding {row['funding_hour']:+.5%}/h | "
+            f"gross APR {row['gross_apr']:+.2%} | net APR {row['net_apr']:+.2%} | "
+            f"basis {row['basis']:+.2%}")
+
+
+def telegram_send(text: str) -> None:
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat, "text": text}, timeout=10).raise_for_status()
+    except requests.RequestException as exc:
+        log.warning("Telegram notification failed: %s", exc)
+
+
+async def run() -> None:
+    markets: dict[str, Market] = {}
+    last_alert: dict[str, float] = {}
+    changed = asyncio.Event()
+
+    async def refresh() -> None:
+        nonlocal markets
+        while True:
+            try:
+                markets = await asyncio.to_thread(load_markets)
+                changed.set()
+                log.info("loaded %d spot/perpetual markets", len(markets))
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                log.warning("market refresh failed: %s", exc)
+            await asyncio.sleep(POLL_SECONDS)
+
+    async def evaluate() -> None:
+        while True:
+            await changed.wait()
+            changed.clear()
+            now = time.monotonic()
+            for market in list(markets.values()):
+                row = opportunity(market)
+                if not row or now - last_alert.get(market.coin, 0) < ALERT_COOLDOWN:
+                    continue
+                last_alert[market.coin] = now
+                message = format_signal(row)
+                log.warning(message)
+                await asyncio.to_thread(telegram_send, message)
+
+    async def funding_stream() -> None:
+        delay = 1.0
+        while True:
+            try:
+                while not markets:
+                    await asyncio.sleep(1)
+                async with websockets.connect(
+                    WS_URL, ping_interval=20, ping_timeout=20,
+                    close_timeout=5, max_size=2**20
+                ) as ws:
+                    delay = 1.0
+                    for coin in markets:
+                        await ws.send(json.dumps({
+                            "method": "subscribe",
+                            "subscription": {"type": "activeAssetCtx", "coin": coin},
+                        }))
+                    log.info("funding WebSocket connected (%d subscriptions)", len(markets))
+                    async for raw in ws:
+                        message = json.loads(raw)
+                        data = message.get("data", {})
+                        coin, ctx = data.get("coin"), data.get("ctx", {})
+                        if coin in markets and isinstance(ctx, dict):
+                            funding = number(ctx.get("funding"))
+                            mark = number(ctx.get("markPx"))
+                            if funding is not None:
+                                markets[coin].funding_hour = funding
+                            if mark and mark > 0:
+                                markets[coin].perp_price = mark
+                            changed.set()
+            except (OSError, asyncio.TimeoutError, websockets.WebSocketException,
+                    json.JSONDecodeError) as exc:
+                log.warning("WebSocket disconnected: %s; retrying in %.0fs", exc, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+
+    await asyncio.gather(refresh(), evaluate(), funding_stream())
 
 
 def main() -> None:
-    print("Hyperliquid funding scanner started. Press Ctrl+C to stop.")
-    while True:
-        try:
-            print_results(scan())
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            return
-        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-            print(f"Data error: {exc}")
-        time.sleep(POLL_SECONDS)
+    log.info("Hyperliquid funding scanner started; Ctrl+C to stop")
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        log.info("stopped")
 
 
 if __name__ == "__main__":
